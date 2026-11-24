@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/AuthContext';
+import { LOGOS } from '../logos';
 
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -39,7 +40,7 @@ export default function Login() {
     <div className="min-h-screen flex items-center justify-center bg-[#0d2818] px-4">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-[#d4af37] tracking-wide">GOLF B</h1>
+          <img src={LOGOS.master.full} alt="Golf B" style={{ height: 96, objectFit: 'contain', margin: '0 auto' }} />
           <p className="text-white/70 mt-2 text-sm">Panel Maestro · Golf Ciudad Real</p>
         </div>
 

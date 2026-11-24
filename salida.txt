@@ -1,0 +1,95 @@
+1: import { createContext, useContext, useEffect, useState } from 'react';
+2: import {
+3:   onAuthStateChanged,
+4:   signInWithEmailAndPassword,
+5:   signOut,
+6:   sendPasswordResetEmail,
+7: } from 'firebase/auth';
+8: import { doc, getDoc } from 'firebase/firestore';
+9: import { auth, db } from '../firebase';
+10: 
+11: const AuthContext = createContext();
+12: 
+13: export function useAuth() {
+14:   return useContext(AuthContext);
+15: }
+16: 
+17: export function AuthProvider({ children }) {
+18:   const [currentUser, setCurrentUser] = useState(null);
+19:   const [userRole, setUserRole] = useState(null);
+20:   // null = todavia no se ha comprobado o el club no tiene el campo (no bloquea nada, retrocompatible)
+21:   const [modulosActivos, setModulosActivos] = useState(null);
+22:   const [tenantId, setTenantId] = useState(null);
+23:   const [loading, setLoading] = useState(true);
+24: 
+25:   async function login(email, password) {
+26:     return signInWithEmailAndPassword(auth, email, password);
+27:   }
+28: 
+29:   function logout() {
+30:     return signOut(auth);
+31:   }
+32: 
+33:   function resetPassword(email) {
+34:     return sendPasswordResetEmail(auth, email);
+35:   }
+36: 
+37:   useEffect(() => {
+38:     const unsubscribe = onAuthStateChanged(auth, async (user) => {
+39:       setCurrentUser(user);
+40:       if (user) {
+41:         let miTenantId = null;
+42:         try {
+43:           const userDoc = await getDoc(doc(db, 'Usuarios', user.uid));
+44:           if (userDoc.exists()) {
+45:             setUserRole(userDoc.data().role || 'pendiente');
+46:             // Retrocompatible: si el usuario aÇ§n no tiene tenantId asignado
+47:             // (usuarios creados antes de esta migraciÇün), se asume Ciudad Real.
+48:             miTenantId = userDoc.data().tenantId || 'ciudad-real';
+49:           } else {
+50:             setUserRole('pendiente');
+51:           }
+52:         } catch (error) {
+53:           console.error('Error al cargar rol:', error);
+54:           setUserRole('pendiente');
+55:         }
+56:         setTenantId(miTenantId);
+57: 
+58:         if (miTenantId) {
+59:           try {
+60:             const clubDoc = await getDoc(doc(db, 'clubes', miTenantId));
+61:             if (clubDoc.exists() && clubDoc.data().modulosActivos) {
+62:               setModulosActivos(clubDoc.data().modulosActivos);
+63:             } else {
+64:               setModulosActivos(null);
+65:             }
+66:           } catch (error) {
+67:             console.error('Error al cargar modulos activos del tenant:', error);
+68:             setModulosActivos(null);
+69:         }
+70:       } else {
+71:         setUserRole(null);
+72:         setModulosActivos(null);
+73:         setTenantId(null);
+74:       }
+75:       setLoading(false);
+76:     });
+77:     return unsubscribe;
+78:   }, []);
+79: 
+80:  const value = {
+81:     currentUser,
+82:     userRole,
+83:     modulosActivos,
+84:     tenantId,
+85:     login,
+86:     logout,
+87:     resetPassword,
+88:   };
+89: 
+90:   return (
+91:     <AuthContext.Provider value={value}>
+92:       {!loading && children}
+93:     </AuthContext.Provider>
+94:   );
+95: }
