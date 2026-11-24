@@ -5,6 +5,7 @@ import { useAuth } from './contexts/AuthContext';
 import { AuthProvider } from './contexts/AuthContext';
 import Login from './pages/Login';
 import { LOGOS } from './logos';
+import MapaGeneral from './MapaGeneral';
 
 
 const APPS = [
@@ -1227,7 +1228,7 @@ function Dashboard() {
         </h2>
         <p className="text-gray-500 mb-8">Selecciona una aplicación para continuar</p>
 
-        {userRole === 'superadmin' && <AdminOverview />}
+        {userRole === 'superadmin' && <MapaGeneral apps={APPS} />}
 
         {visibleApps.length === 0 ? (
           <div className="bg-white rounded-2xl shadow-md p-8 text-center">
