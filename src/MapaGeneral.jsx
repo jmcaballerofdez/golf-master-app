@@ -62,6 +62,7 @@ function useColl(ruta, activo = true) {
 // Ventas del TPV (Excel) por mes: 13 meses hacia atrás + los mismos meses del año anterior para la comparativa.
 function useVentasMes(tenantId, ahora) {
   const [meses, setMeses] = useState({});
+  const [fam, setFam] = useState({});
   useEffect(() => {
     let vivo = true;
     const claves = [];
@@ -72,13 +73,17 @@ function useVentasMes(tenantId, ahora) {
     Promise.all(
       claves.map((k) =>
         getDoc(doc(db, 'clubes', tenantId, 'ventas_gcr', k))
-          .then((s) => [k, s.exists() ? Number(s.data().total || 0) : null])
-          .catch(() => [k, null])
+          .then((s) => [k, s.exists() ? Number(s.data().total || 0) : null, s.exists() ? s.data().porFamilia || {} : null])
+          .catch(() => [k, null, null])
       )
-    ).then((r) => vivo && setMeses(Object.fromEntries(r)));
+    ).then((r) => {
+      if (!vivo) return;
+      setMeses(Object.fromEntries(r.map((x) => [x[0], x[1]])));
+      setFam(Object.fromEntries(r.map((x) => [x[0], x[2]])));
+    });
     return () => { vivo = false; };
   }, [tenantId, ahora.getFullYear(), ahora.getMonth()]);
-  return meses;
+  return { meses, fam };
 }
 
 // ─── Piezas visuales ────────────────────────────────────────────────
@@ -181,12 +186,12 @@ export default function MapaGeneral({ apps }) {
   const zonas = useColl(['clubes', tenantId, 'mant_zonas']);
   const ausencias = useColl(['clubes', tenantId, 'mant_ausencias']);
   const misTareas = useColl(['clubes', 'ciudad-real', 'tareas_personales']);
-  const ventasMes = useVentasMes(tenantId, ahora);
+  const { meses: ventasMes, fam: famMes } = useVentasMes(tenantId, ahora);
 
   // Último consumo de agua
   const [lecturas, setLecturas] = useState([]);
   useEffect(() => {
-    const q = query(collection(db, 'clubes', tenantId, 'mant_lecturas_caudalimetro'), orderBy('momento', 'desc'), limit(40));
+    const q = query(collection(db, 'clubes', tenantId, 'mant_lecturas_caudalimetro'), orderBy('momento', 'desc'), limit(600));
     return onSnapshot(q, (s) => setLecturas(s.docs.map((d) => ({ ...d.data(), id: d.id }))), () => {});
   }, [tenantId]);
 
@@ -223,8 +228,33 @@ export default function MapaGeneral({ apps }) {
       });
     }
     const sinCuenta = club.filter((t) => t.type === 'expense' && !t.cuenta && ['proveedores', 'nominas'].includes(t.origen) && aFecha(t.date)?.getFullYear() === y);
-    return { tpv, tpvAnt, gastos, gastosAnt, acum, acumAnt, serie, sinCuenta, comp: mesesAcum === mesesAcumAnt };
-  }, [transacciones, ventasMes]);
+    // Gastos acumulados del año frente al mismo tramo del año anterior (hasta hoy)
+    const hastaHoy = (anio) => club.filter((t) => {
+      const f = aFecha(t.date);
+      return t.type === 'expense' && f && f.getFullYear() === anio && (f.getMonth() < m || (f.getMonth() === m && f.getDate() <= ahora.getDate()));
+    }).reduce((s, t) => s + Number(t.amount || 0), 0);
+    const gastosAnio = hastaHoy(y), gastosAnioAnt = hastaHoy(y - 1);
+    // Gastos del mes por categoría
+    const porCat = {};
+    club.forEach((t) => {
+      const f = aFecha(t.date);
+      if (t.type !== 'expense' || !f || f.getFullYear() !== y || f.getMonth() !== m) return;
+      const c = t.category || 'Sin categoría';
+      porCat[c] = (porCat[c] || 0) + Number(t.amount || 0);
+    });
+    const cats = Object.entries(porCat).sort((a, b) => b[1] - a[1]);
+    // Mejor y peor mes de ventas (últimos 12 meses completos con datos)
+    const conDatos = serie.slice(0, 11).map((s, i) => ({ ...s, i })).filter((s) => s.v != null && s.v > 0);
+    const nombreMes = (i) => { const d = new Date(y, m - 11 + i, 1); return `${MESES[d.getMonth()]} ${d.getFullYear()}`; };
+    const mejor = conDatos.length ? conDatos.reduce((a, b) => (b.v > a.v ? b : a)) : null;
+    const peor = conDatos.length ? conDatos.reduce((a, b) => (b.v < a.v ? b : a)) : null;
+    // Familias del TPV: este mes frente al mismo mes del año anterior
+    const fa = famMes[mesKey] || {}, fb = famMes[`${y - 1}-${pad(m + 1)}`] || {};
+    const familias = [...new Set([...Object.keys(fa), ...Object.keys(fb)])]
+      .map((f) => ({ f, a: Number(fa[f]?.total || 0), b: Number(fb[f]?.total || 0) }))
+      .filter((x) => x.a || x.b).sort((p, q) => q.a + q.b - (p.a + p.b));
+    return { tpv, tpvAnt, gastos, gastosAnt, gastosAnio, gastosAnioAnt, cats, mejor: mejor && { ...mejor, n: nombreMes(mejor.i) }, peor: peor && { ...peor, n: nombreMes(peor.i) }, familias, acum, acumAnt, serie, sinCuenta, comp: mesesAcum === mesesAcumAnt };
+  }, [transacciones, ventasMes, famMes]);
 
   // ── HOY ──
   const hoyClub = useMemo(() => {
@@ -270,7 +300,17 @@ export default function MapaGeneral({ apps }) {
       const a = ls[0], b = ls[1];
       return { nombre: a.caudalimetroNombre, lectura: a.lectura, dif: b ? a.lectura - b.lectura : null, fecha: aFecha(a.momento) };
     });
-    return { pend, venc, operativas, revVenc, revPronto, fuera, sinStock, stockBajo, zProb, ausPend, graves, agua };
+    const dia = 86400000, t0 = Date.now();
+    const lecEn = (ls, ms) => ls.find((l) => (aFecha(l.momento) || 0) <= ms); // ls ya ordenada desc
+    const agua30 = Object.values(porC).map((ls) => {
+      const ahoraL = ls[0], hace30 = lecEn(ls, t0 - 30 * dia), hace60 = lecEn(ls, t0 - 60 * dia);
+      return {
+        nombre: ahoraL.caudalimetroNombre,
+        ult: hace30 ? ahoraL.lectura - hace30.lectura : null,
+        prev: hace30 && hace60 ? hace30.lectura - hace60.lectura : null,
+      };
+    });
+    return { agua30, pend, venc, operativas, revVenc, revPronto, fuera, sinStock, stockBajo, zProb, ausPend, graves, agua };
   }, [tareas, maquinaria, inventario, zonas, ausencias, lecturas, hoyClub]);
 
   // ── ALERTAS ──
@@ -330,6 +370,38 @@ export default function MapaGeneral({ apps }) {
         </div>
         <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400 mb-1">Ventas de los últimos 12 meses <span className="normal-case font-normal">· raya = mismo mes del año anterior</span></p>
         <GraficoMeses serie={dinero.serie} color={colorApp('finanzas')} />
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-5">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400 mb-2">Ventas por familia · {mesNombre} vs {ahora.getFullYear() - 1}</p>
+            {dinero.familias.length === 0 ? <p className="text-xs text-gray-400">Sin ventas por familia este mes ni el año pasado.</p> : dinero.familias.map((x) => (
+              <div key={x.f} className="flex items-baseline justify-between text-sm py-1.5 border-b border-gray-100 last:border-0">
+                <span className="text-gray-700 truncate pr-2">{x.f}</span>
+                <span className="text-right whitespace-nowrap">
+                  <b className="text-gray-800">{eur(x.a)}</b>
+                  <span className="text-xs ml-2" style={{ color: !x.b ? '#8a96a0' : x.a >= x.b ? TONO.verde : TONO.rojo }}>
+                    {x.b ? `${x.a >= x.b ? '▲' : '▼'} ${Math.abs(((x.a - x.b) / x.b) * 100).toFixed(0)} %` : 'nuevo'}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400 mb-2">Gastos del mes por categoría</p>
+            {dinero.cats.length === 0 ? <p className="text-xs text-gray-400">Aún no hay gastos registrados este mes.</p> : dinero.cats.slice(0, 6).map(([c, v]) => (
+              <div key={c} className="mb-2">
+                <div className="flex justify-between text-xs text-gray-600"><span className="truncate pr-2">{c}</span><b>{eur(v)}</b></div>
+                <div className="h-1.5 rounded bg-gray-100 mt-1"><div className="h-1.5 rounded" style={{ width: `${(v / dinero.cats[0][1]) * 100}%`, background: colorApp('finanzas') }} /></div>
+              </div>
+            ))}
+            {dinero.cats.length > 6 && <p className="text-xs text-gray-400">y {dinero.cats.length - 6} categorías más</p>}
+          </div>
+          <div className="space-y-3">
+            <Cifra label={`Gastos del año hasta hoy`} valor={eur(dinero.gastosAnio)} sub={<Delta inverso actual={dinero.gastosAnio} previo={dinero.gastosAnioAnt} etiqueta={`${ahora.getFullYear() - 1}`} />} />
+            <Cifra label="Mejor mes de ventas (12 m)" valor={dinero.mejor ? eur(dinero.mejor.v) : '—'} sub={dinero.mejor ? dinero.mejor.n : 'Sin datos'} tono="verde" />
+            <Cifra label="Peor mes de ventas (12 m)" valor={dinero.peor ? eur(dinero.peor.v) : '—'} sub={dinero.peor ? dinero.peor.n : 'Sin datos'} />
+          </div>
+        </div>
       </Bloque>
 
       <Bloque app="recepcion" color={colorApp('recepcion')} titulo="Hoy en el club" sub="Clases, personal e incidencias">
@@ -355,6 +427,22 @@ export default function MapaGeneral({ apps }) {
           <Cifra label="Agua (última lectura)" valor={campo.agua.length ? `${campo.agua.reduce((s, a) => s + (a.dif || 0), 0).toLocaleString('es-ES', { maximumFractionDigits: 1 })} m³` : '—'}
             sub={campo.agua.length ? campo.agua.map((a) => `${a.nombre}: ${a.dif != null ? (a.dif >= 0 ? '+' : '') + a.dif.toLocaleString('es-ES', { maximumFractionDigits: 1 }) + ' m³' : 'primera lectura'}`).join(' · ') : 'Sin lecturas'} href={url('mantenimiento')} />
         </div>
+        {campo.agua30.length > 0 && (
+          <div className="mt-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400 mb-2">Consumo de agua · últimos 30 días frente a los 30 anteriores</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {campo.agua30.map((a) => (
+                <div key={a.nombre} className="rounded-xl border border-gray-100 bg-[#fbfcfb] p-3">
+                  <p className="text-xs text-gray-500">{a.nombre}</p>
+                  <p className="text-lg font-bold" style={{ color: '#1a472a' }}>{a.ult != null ? `${a.ult.toLocaleString('es-ES', { maximumFractionDigits: 0 })} m³` : '—'}</p>
+                  <p className="text-xs">
+                    {a.ult != null && a.prev ? <span style={{ color: a.ult <= a.prev ? TONO.verde : TONO.ambar }}>{a.ult > a.prev ? '▲' : '▼'} {Math.abs(((a.ult - a.prev) / a.prev) * 100).toFixed(0)} % <span className="text-gray-400">vs {a.prev.toLocaleString('es-ES', { maximumFractionDigits: 0 })} m³</span></span> : <span className="text-gray-400">faltan lecturas para comparar</span>}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </Bloque>
     </div>
   );
