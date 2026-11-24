@@ -45,6 +45,25 @@ function nivelRevision(m) {
   return nivel;
 }
 
+// Conceptos de venta que se comparan con el año anterior (a partir de familia/subfamilia del TPV)
+const CONCEPTOS = [
+  { id: 'cuotas', nombre: 'Cuotas sociales', es: (f, s) => f === 'CUOTAS' && s.includes('CUOTA MENSUAL SOCIAL') },
+  { id: 'gfs', nombre: 'Green fees', es: (f, s) => s.startsWith('GFS') },
+  { id: 'alq', nombre: 'Alquileres', es: (f, s) => s.startsWith('ALQUILERES') },
+  { id: 'inf', nombre: 'Academia infantil', es: (f, s) => s.includes('ESCUELA INFANTIL') },
+];
+const mayus = (v) => String(v || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+function totalesConceptos(lineas) {
+  const r = {};
+  CONCEPTOS.forEach((c) => (r[c.id] = 0));
+  (lineas || []).forEach((l) => {
+    const f = mayus(l.f), s = mayus(l.s);
+    const c = CONCEPTOS.find((x) => x.es(f, s));
+    if (c) r[c.id] += Number(l.t || 0);
+  });
+  return r;
+}
+
 // ─── Datos ──────────────────────────────────────────────────────────
 function useColl(ruta, activo = true) {
   const [datos, setDatos] = useState([]);
@@ -63,6 +82,7 @@ function useColl(ruta, activo = true) {
 function useVentasMes(tenantId, ahora) {
   const [meses, setMeses] = useState({});
   const [fam, setFam] = useState({});
+  const [con, setCon] = useState({});
   useEffect(() => {
     let vivo = true;
     const claves = [];
@@ -73,17 +93,18 @@ function useVentasMes(tenantId, ahora) {
     Promise.all(
       claves.map((k) =>
         getDoc(doc(db, 'clubes', tenantId, 'ventas_gcr', k))
-          .then((s) => [k, s.exists() ? Number(s.data().total || 0) : null, s.exists() ? s.data().porFamilia || {} : null])
-          .catch(() => [k, null, null])
+          .then((s) => [k, s.exists() ? Number(s.data().total || 0) : null, s.exists() ? s.data().porFamilia || {} : null, s.exists() ? totalesConceptos(s.data().lineas) : null])
+          .catch(() => [k, null, null, null])
       )
     ).then((r) => {
       if (!vivo) return;
       setMeses(Object.fromEntries(r.map((x) => [x[0], x[1]])));
       setFam(Object.fromEntries(r.map((x) => [x[0], x[2]])));
+      setCon(Object.fromEntries(r.map((x) => [x[0], x[3]])));
     });
     return () => { vivo = false; };
   }, [tenantId, ahora.getFullYear(), ahora.getMonth()]);
-  return { meses, fam };
+  return { meses, fam, con };
 }
 
 // ─── Piezas visuales ────────────────────────────────────────────────
@@ -152,6 +173,71 @@ function GraficoMeses({ serie, color }) {
   );
 }
 
+// Comparativa de un concepto: acumulado del año hasta el último mes cerrado y mes en curso, frente al año anterior
+function ComparativaVentas({ con, ahora, color }) {
+  const y = ahora.getFullYear(), m = ahora.getMonth();
+  const val = (yy, mm, id) => con[`${yy}-${pad(mm + 1)}`]?.[id] ?? null;
+  const filas = CONCEPTOS.map((c) => {
+    let a = 0, b = 0, n = 0;
+    for (let i = 0; i < m; i++) { // meses cerrados de este año
+      const va = val(y, i, c.id), vb = val(y - 1, i, c.id);
+      if (va == null) continue;
+      a += va; b += vb || 0; n++;
+    }
+    const serie = [];
+    for (let i = 0; i < 12; i++) serie.push({ mes: MESES_C[i], v: i <= m ? val(y, i, c.id) : null, prev: val(y - 1, i, c.id) });
+    return { c, a, b, n, mesA: val(y, m, c.id), mesB: val(y - 1, m, c.id), serie };
+  });
+  const tA = filas.reduce((s, f) => s + f.a, 0), tB = filas.reduce((s, f) => s + f.b, 0);
+  const pct = (a, b) => (b ? `${a >= b ? '▲' : '▼'} ${Math.abs(((a - b) / b) * 100).toFixed(1)} %` : '—');
+  const col = (a, b) => (!b ? '#8a96a0' : a >= b ? TONO.verde : TONO.rojo);
+  const hasta = m === 0 ? null : MESES[m - 1];
+  return (
+    <div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm" style={{ minWidth: 560 }}>
+          <thead>
+            <tr className="text-[11px] uppercase tracking-wider text-gray-400 text-right">
+              <th className="text-left font-semibold pb-2">Concepto</th>
+              <th className="font-semibold pb-2">{y} hasta {hasta || '—'}</th>
+              <th className="font-semibold pb-2">{y - 1} mismo tramo</th>
+              <th className="font-semibold pb-2">Diferencia</th>
+              <th className="font-semibold pb-2">{MESES[m]} (en curso)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filas.map((f) => (
+              <tr key={f.c.id} className="border-t border-gray-100 text-right">
+                <td className="text-left py-2 font-medium text-gray-800">{f.c.nombre}</td>
+                <td className="py-2 font-semibold">{f.n ? eur(f.a) : '—'}</td>
+                <td className="py-2 text-gray-600">{f.n ? eur(f.b) : '—'}</td>
+                <td className="py-2 font-semibold" style={{ color: col(f.a, f.b) }}>{f.n ? <>{pct(f.a, f.b)} <span className="text-xs font-normal">({f.a - f.b >= 0 ? '+' : ''}{eur(f.a - f.b)})</span></> : '—'}</td>
+                <td className="py-2 text-gray-600">{f.mesA != null ? eur(f.mesA) : '—'} <span className="text-xs" style={{ color: col(f.mesA || 0, f.mesB) }}>{f.mesB ? `vs ${eur(f.mesB)}` : ''}</span></td>
+              </tr>
+            ))}
+            <tr className="border-t-2 border-gray-200 text-right font-bold">
+              <td className="text-left py-2 text-[#1a472a]">Total de los cuatro</td>
+              <td className="py-2">{eur(tA)}</td>
+              <td className="py-2 text-gray-600">{eur(tB)}</td>
+              <td className="py-2" style={{ color: col(tA, tB) }}>{pct(tA, tB)} <span className="text-xs font-normal">({tA - tB >= 0 ? '+' : ''}{eur(tA - tB)})</span></td>
+              <td />
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-5">
+        {filas.map((f) => (
+          <div key={f.c.id}>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400">{f.c.nombre} · mes a mes <span className="normal-case font-normal">· raya = {y - 1}</span></p>
+            <GraficoMeses serie={f.serie} color={color} />
+          </div>
+        ))}
+      </div>
+      <p className="text-[11px] text-gray-400 mt-3">Cuotas sociales = cuota mensual social (no incluye la cuota extra de bombeo). Green fees = todas las líneas «GFS». El tramo comparado son los meses completos ya cerrados; el mes en curso se muestra aparte porque está incompleto.</p>
+    </div>
+  );
+}
+
 function Alerta({ tono, titulo, detalle, href, app }) {
   return (
     <a href={href} target="_blank" rel="noopener noreferrer" className="flex items-start gap-3 py-2.5 border-b border-gray-100 last:border-0 hover:bg-[#f6f8f7] -mx-2 px-2 rounded-lg transition">
@@ -186,7 +272,14 @@ export default function MapaGeneral({ apps }) {
   const zonas = useColl(['clubes', tenantId, 'mant_zonas']);
   const ausencias = useColl(['clubes', tenantId, 'mant_ausencias']);
   const misTareas = useColl(['clubes', 'ciudad-real', 'tareas_personales']);
-  const { meses: ventasMes, fam: famMes } = useVentasMes(tenantId, ahora);
+  const { meses: ventasMes, fam: famMes, con: conMes } = useVentasMes(tenantId, ahora);
+
+  // Resumen de pagos pendientes de alumnos: lo escribe Academia (superadmin) cada vez que cambian los datos
+  const [pendAcad, setPendAcad] = useState(null);
+  useEffect(() => {
+    return onSnapshot(doc(db, 'clubes', tenantId, 'resumenes', 'academia_pendientes'),
+      (s) => setPendAcad(s.exists() ? s.data() : null), () => setPendAcad(null));
+  }, [tenantId]);
 
   // Último consumo de agua
   const [lecturas, setLecturas] = useState([]);
@@ -330,11 +423,14 @@ export default function MapaGeneral({ apps }) {
     const sinCerrar = fichProshop.filter((f) => f.entrada && !f.salida && aFecha(f.entrada) && isoDe(aFecha(f.entrada)) < hoy);
     if (sinCerrar.length) out.push({ tono: 'ambar', titulo: `${plural(sinCerrar.length, 'fichaje sin cerrar', 'fichajes sin cerrar')} de días anteriores`, detalle: lista(sinCerrar, (f) => f.empleadoNombre || '—'), app: 'recepcion', href: url('recepcion') });
     if (dinero.sinCuenta.length) out.push({ tono: 'ambar', titulo: `${plural(dinero.sinCuenta.length, 'gasto sin cuenta contable', 'gastos sin cuenta contable')}`, detalle: lista(dinero.sinCuenta, (t) => t.proveedor || t.description || '—'), app: 'finanzas', href: url('finanzas') });
+    if (pendAcad && pendAcad.total > 0)
+      out.push({ tono: 'ambar', titulo: `${eur(pendAcad.total)} pendientes de cobrar · ${plural(pendAcad.nAlumnos, 'alumno', 'alumnos')}`,
+        detalle: lista(pendAcad.alumnos || [], (a) => `${a.nombre} (${eur(a.total)})`), app: 'academia', href: url('academia') });
     // Mis tareas personales vencidas
     const mv = misTareas.filter((t) => !t.hecha && t.fechaLimite && t.fechaLimite < hoy);
     if (mv.length) out.push({ tono: 'rojo', titulo: `${plural(mv.length, 'tarea tuya vencida', 'tareas tuyas vencidas')}`, detalle: lista(mv, (t) => t.titulo), app: 'master', href: '#' });
     return out.sort((a, b) => (a.tono === b.tono ? 0 : a.tono === 'rojo' ? -1 : 1));
-  }, [campo, dinero, fichProshop, misTareas]);
+  }, [campo, dinero, fichProshop, misTareas, pendAcad]);
 
   const mesNombre = MESES[ahora.getMonth()];
   const colMaster = '#B8962E';
@@ -404,14 +500,20 @@ export default function MapaGeneral({ apps }) {
         </div>
       </Bloque>
 
+      <Bloque app="finanzas" color={colorApp('finanzas')} titulo={`Ventas del club · ${ahora.getFullYear()} frente a ${ahora.getFullYear() - 1}`} sub="Cuotas sociales, green fees, alquileres y academia infantil">
+        <ComparativaVentas con={conMes} ahora={ahora} color={colorApp('finanzas')} />
+      </Bloque>
+
       <Bloque app="recepcion" color={colorApp('recepcion')} titulo="Hoy en el club" sub="Clases, personal e incidencias">
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
           <Cifra label="Clases hoy" valor={hoyClub.cl.length}
             sub={hoyClub.cl.length ? lista(hoyClub.cl, (c) => `${c.horaInicio || ''} ${c.alumnoNombre || c.nombre || ''}`.trim(), 2) : 'Sin clases'} href={url('academia')} />
           <Cifra label="Personal trabajando" valor={hoyClub.trabajando.length}
             sub={hoyClub.trabajando.length ? lista(hoyClub.trabajando, (n) => n, 3) : 'Nadie fichado ahora'} href={url('recepcion')} />
           <Cifra label="Incidencias abiertas" valor={hoyClub.abiertos.length} tono={hoyClub.abiertos.length ? 'ambar' : 'verde'}
             sub={hoyClub.abiertos.length ? lista(hoyClub.abiertos, (p) => p.titulo, 2) : 'Ninguna'} href={url('mantenimiento')} />
+          <Cifra label="Pendiente de cobrar (Academia)" valor={pendAcad ? eur(pendAcad.total) : '—'} tono={pendAcad && pendAcad.total > 0 ? 'ambar' : pendAcad ? 'verde' : undefined}
+            sub={pendAcad ? (pendAcad.total > 0 ? `${plural(pendAcad.nAlumnos, 'alumno', 'alumnos')} · ${plural(pendAcad.nCobros, 'cobro', 'cobros')}` : 'Nada pendiente') : 'Se actualiza al abrir Academia'} href={url('academia')} />
           <Cifra label="Mis tareas pendientes" valor={misTareas.filter((t) => !t.hecha).length} sub="Las tuyas, en Mis tareas" />
         </div>
       </Bloque>
